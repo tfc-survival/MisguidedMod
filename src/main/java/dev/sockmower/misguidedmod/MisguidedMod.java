@@ -188,10 +188,6 @@ public class MisguidedMod {
 
     @SubscribeEvent
     public void onGameConnected(FMLNetworkEvent.ClientConnectedToServerEvent event) {
-        ServerData currentServerData = mc.getCurrentServerData();
-        if (currentServerData == null || !mc.getCurrentServerData().serverIP.equals("play.wynncraft.com")) {
-            return;
-        }
         logger.info("Connected to server {}, client render distance is {}",
                 mc.getCurrentServerData().serverIP,
                 mc.gameSettings.renderDistanceChunks);
@@ -199,7 +195,7 @@ public class MisguidedMod {
         insertPacketHandler();
 
         cachedWorld = new CachedWorld(
-                Paths.get(mc.mcDataDir.getAbsolutePath() + "\\misguidedmod\\" + mc.getCurrentServerData().serverIP),
+                Paths.get(mc.mcDataDir.getAbsolutePath() + "\\cached\\" + "world"),
                 logger,
                 mc,
                 this

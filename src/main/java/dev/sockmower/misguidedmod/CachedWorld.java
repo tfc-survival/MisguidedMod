@@ -102,7 +102,7 @@ public class CachedWorld {
                         if (reg.poison) { logger.info("Exiting region prune thread"); return; }
                         if (System.currentTimeMillis() - reg.lastAccessed > 60000) {
                             reg.close();
-                            regionCache.remove(key);
+                            regionCache.remove(key, reg);
                         }
                     }
                     Thread.sleep(5000);
@@ -116,13 +116,15 @@ public class CachedWorld {
 
     public CachedRegion getCachedRegion(int x, int z) throws IOException {
         String key = String.format("%d.%d", x, z);
-        CachedRegion reg;
-        if (!regionCache.containsKey(key)) {
-            reg = new CachedRegion(directory, x, z, logger);
-            regionCache.put(key, reg);
-        } else {
-            reg = regionCache.get(key);
-        }
+
+        CachedRegion reg = regionCache.computeIfAbsent(key, k -> {
+            try {
+                return new CachedRegion(directory, x, z, logger);
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+
         reg.lastAccessed = System.currentTimeMillis();
         return reg;
     }

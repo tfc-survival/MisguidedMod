@@ -32,6 +32,8 @@ public class CachedRegion implements Closeable {
     public long lastAccessed;
     public boolean poison;
 
+    private final Object ioLock = new Object();
+
     CachedRegion(boolean poison) {
         this.poison = poison;
     }
@@ -57,7 +59,7 @@ public class CachedRegion implements Closeable {
         for (int i = 0; i < CHUNKS_PER_REGION; i++) {
             ByteBuffer header = BufferUtils.createByteBuffer(8);
             seekableStream.position(i * 8);
-            seekableStream.read(header);
+            readFully(seekableStream, header);
 
             lookupTable.put(i, new ChunkHeader(header.getInt(0), header.getInt(4), i * 8));
         }
@@ -67,41 +69,63 @@ public class CachedRegion implements Closeable {
         return lookupTable.get((pos.x & 31) | ((pos.z & 31) << 5));
     }
 
-    CachedChunk getChunk(Pos2 pos) throws IOException {
-        ChunkHeader header = getChunkHeader(pos);
-        if (!header.chunkExists()) {
-            return null;
+    private static void readFully(SeekableByteChannel ch, ByteBuffer buf) throws IOException {
+        while (buf.hasRemaining()) {
+            int r = ch.read(buf);
+            if (r < 0) throw new IOException("Unexpected EOF");
+            if (r == 0) Thread.yield();
         }
-
-        seekableStream.position(header.offset);
-        ByteBuffer chunkData = BufferUtils.createByteBuffer(header.size);
-        seekableStream.read(chunkData);
-        chunkData.flip();
-
-        ZstdDecompressor decompressor = new ZstdDecompressor();
-
-        long size = ZstdDecompressor.getDecompressedSize(chunkData);
-        ByteBuffer decompressed = BufferUtils.createByteBuffer((int)size);
-
-        decompressor.decompress(chunkData, decompressed);
-
-        ByteBuf buffer = Unpooled.buffer();
-        decompressed.flip();
-        buffer.writeBytes(decompressed);
-        buffer.readerIndex(0);
-
-        SPacketChunkData chunkPacket = new SPacketChunkData();
-        try {
-            chunkPacket.readPacketData(new PacketBuffer(buffer));
-        } catch (Exception ignored) {
-            logger.warn("Malformed chunk at {}", pos.toString());
-            return null;
-        }
-        return new CachedChunk(pos, chunkPacket);
     }
 
+    CachedChunk getChunk(Pos2 pos) throws IOException {
+        ChunkHeader header = getChunkHeader(pos);
+        if (header == null || !header.chunkExists() || header.size <= 0) {
+            return null;
+        }
+
+        ByteBuffer compressed;
+
+        synchronized (ioLock) {
+            seekableStream.position(header.offset);
+            compressed = BufferUtils.createByteBuffer(header.size);
+            readFully(seekableStream, compressed);
+            compressed.flip();
+        }
+
+        try {
+            ZstdDecompressor decompressor = new ZstdDecompressor();
+
+            long decompressedSize = ZstdDecompressor.getDecompressedSize(compressed);
+            if (decompressedSize <= 0 || decompressedSize > (128L * 1024 * 1024)) { // защита от мусора
+                logger.warn("Bad decompressed size {} at {} (off={}, sz={})",
+                        decompressedSize, pos, header.offset, header.size);
+                return null;
+            }
+
+            ByteBuffer decompressed = BufferUtils.createByteBuffer((int) decompressedSize);
+            decompressor.decompress(compressed, decompressed);
+
+            ByteBuf buffer = Unpooled.buffer(decompressed.position());
+            decompressed.flip();
+            buffer.writeBytes(decompressed);
+            buffer.readerIndex(0);
+
+            SPacketChunkData chunkPacket = new SPacketChunkData();
+            chunkPacket.readPacketData(new PacketBuffer(buffer));
+
+            return new CachedChunk(pos, chunkPacket);
+        } catch (dev.sockmower.misguidedmod.repack.io.airlift.compress.MalformedInputException ex) {
+            // Это и есть твои "Invalid magic prefix" / "Not enough input bytes"
+            logger.warn("Corrupt cached chunk at {} (off={}, sz={}): {}",
+                    pos, header.offset, header.size, ex.toString());
+            return null;
+        } catch (Exception ex) {
+            logger.warn("Malformed chunk at {} (off={}, sz={})", pos, header.offset, header.size, ex);
+            return null;
+        }
+    }
     void writeHeader(ChunkHeader head) throws IOException {
-        //lookupTable.put(head.headerOffset/8, head);
+        lookupTable.put((int) (head.headerOffset / 8), head);
 
         seekableStream.position(head.headerOffset);
 
@@ -109,66 +133,75 @@ public class CachedRegion implements Closeable {
         header.putInt(head.offset);
         header.putInt(head.size);
 
-        seekableStream.write((ByteBuffer)header.flip());
+        seekableStream.write((ByteBuffer) header.flip());
+    }
+
+    private ChunkHeader findMaxChunk() {
+        ChunkHeader max = new ChunkHeader(0, CHUNKS_PER_REGION * 8, -1);
+        for (int i = 0; i < CHUNKS_PER_REGION; i++) {
+            ChunkHeader head = lookupTable.get(i);
+            if (head != null && head.chunkExists() && head.offset > max.offset) {
+                max = head;
+            }
+        }
+        return max;
     }
 
     void writeChunk(CachedChunk chunk) throws IOException {
-        ChunkHeader header = getChunkHeader(chunk.pos);
+        synchronized (ioLock) {
+            ChunkHeader header = getChunkHeader(chunk.pos);
 
-        PacketBuffer buffer = new PacketBuffer(Unpooled.buffer());
-        chunk.packet.writePacketData(buffer);
-        int size = buffer.readableBytes();
+            PacketBuffer buffer = new PacketBuffer(Unpooled.buffer());
+            chunk.packet.writePacketData(buffer);
+            int rawSize = buffer.readableBytes();
 
-        ByteBuffer chunkData = BufferUtils.createByteBuffer(size);
-        buffer.readBytes(chunkData);
-        chunkData.flip();
+            ByteBuffer chunkData = BufferUtils.createByteBuffer(rawSize);
+            buffer.readBytes(chunkData);
+            chunkData.flip();
 
-        ZstdCompressor compressor = new ZstdCompressor();
-        ByteBuffer compressed = BufferUtils.createByteBuffer(compressor.maxCompressedLength(size));
-        compressor.compress(chunkData, compressed);
+            ZstdCompressor compressor = new ZstdCompressor();
+            ByteBuffer compressed = BufferUtils.createByteBuffer(compressor.maxCompressedLength(rawSize));
+            compressor.compress(chunkData, compressed);
 
-        int newSize = compressed.position();
+            int newSize = compressed.position();
+            compressed.flip();
 
-        if (header.chunkExists()) {
-            // TODO: this doesn't actually work
-            if (size > header.size) {
-                //logger.info("Skipping region {} because {} < {}", chunk.toString(), header.size, chunk.packet.getExtractedSize());
-            } else {
-                //seekableStream.position(header.offset);
+            if (header.chunkExists()) {
+                if (newSize <= header.size) {
+                    seekableStream.position(header.offset);
+                    seekableStream.write(compressed);
 
-                //ByteBuffer chunkData = ByteBuffer.allocate(size);
-                //PacketBuffer pbuffer = new PacketBuffer(Unpooled.wrappedBuffer(chunkData));
+                    header.size = newSize;
+                    writeHeader(header);
+                } else {
+                    ChunkHeader max = findMaxChunk();
+                    int newOffset = max.offset + max.size;
 
-                //seekableStream.position(header.offset);
-                //chunk.packet.writePacketData(pbuffer);
+                    seekableStream.position(newOffset);
+                    seekableStream.write(compressed);
 
-                //seekableStream.write((ByteBuffer)chunkData.flip());
-                //writeHeader(header);
-            }
-        } else {
-            ChunkHeader max = new ChunkHeader(0, CHUNKS_PER_REGION * 8, -1);
-            for (int i = 0; i < CHUNKS_PER_REGION; i++) {
-                ChunkHeader head = lookupTable.get(i);
-                if (head.offset > max.offset && head.chunkExists()) {
-                    max = head;
+                    header.offset = newOffset;
+                    header.size = newSize;
+                    writeHeader(header);
                 }
+            } else {
+                ChunkHeader max = findMaxChunk();
+                int newOffset = max.offset + max.size;
+
+                seekableStream.position(newOffset);
+                seekableStream.write(compressed);
+
+                header.offset = newOffset;
+                header.size = newSize;
+                writeHeader(header);
             }
-
-            seekableStream.position(max.offset + max.size);
-
-            header.size = newSize;
-            header.offset = max.offset + max.size;
-
-            //logger.info("Writing compressed chunk ({} bytes, down from {}) at offset {}", newSize, size, header.offset);
-
-            seekableStream.write((ByteBuffer)compressed.flip());
-
-            writeHeader(header);
         }
     }
 
     @Override
     public void close() throws IOException {
-        seekableStream.close();
+        synchronized (ioLock) {
+            seekableStream.close();
+        }
     }
 }

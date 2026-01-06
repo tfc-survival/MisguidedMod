@@ -37,8 +37,10 @@ public class PacketHandler extends SimpleChannelInboundHandler<Packet<?>> implem
                 if (chunkPacket.isFullChunk()) {
                     // full chunk, not just a section
                     final Pos2 pos = new Pos2(chunkPacket.getChunkX(), chunkPacket.getChunkZ());
-                    moreChunks.onReceiveGameChunk(new CachedChunk(pos, chunkPacket));
-                    return; // drop packet, we load it manually
+                    if(Math.abs(pos.x) < 16000 && Math.abs(pos.z) < 16000) { // logic for anti-cached ships
+                        moreChunks.onReceiveGameChunk(new CachedChunk(pos, chunkPacket));
+                        return; // drop packet, we load it manually
+                    }
                 }
             } catch (Exception e) {
                 e.printStackTrace();
